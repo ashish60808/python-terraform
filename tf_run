@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+
+# Sample Run :: ./tf_run plan jupyterhub --portfolio studio --product search --environment dev --region us-west-2
+
+import os
+import sys
+from python_terraform import Terraform, IsNotFlagged
+import click
+import boto3
+
+region = os.getenv('AWS_REGION', 'us-west-2')
+portfolio = os.getenv('PORTFOLIO')
+product = os.getenv('PRODUCT')
+environment = os.getenv('ENVIRONMENT', 'dev')
+
+ec2 = boto3.client('ec2', region_name=region)
+tf = Terraform()
+
+base_directory = os.path.dirname(os.path.realpath(__file__))
+
+
+def validate_args(command, component, log_level, region):
+    components = os.listdir(os.path.join(base_directory, "infra", "components"))
+    response = ec2.describe_regions()
+
+    regions = [reg['RegionName'] for reg in response['Regions']]
+
+    if command not in ['plan', 'apply', 'destroy', 'list']:
+        sys.exit("invalid command. Valid values are 'plan', 'apply', 'destroy', 'list'")
+    if component not in components:
+        sys.exit("invalid component. Valid values are {components}")
+    if region not in regions:
+        sys.exit('Invalid aws region {region}')
+    if log_level not in ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR', None]:
+        sys.exit('Invalid log level for terraform')
+
+
+def get_additional_tf_args(working_directory, portfolio, product, environment, component, region):
+    extra_vars = {
+        'portfolio': portfolio,
+        'product': product,
+        'region': region,
+        'environment': environment,
+        'common_tags': {'Product': product, 'Portfolio': portfolio, 'Environment': environment}
+    }
+
+    additional_tf_args = {
+        "capture_output": False,
+        "var_file": [],
+        "var": extra_vars
+    }
+    if os.path.isfile(os.path.join(working_directory, "{}.tfvars".format(product))):
+        additional_tf_args["var_file"].append("{}.tfvars".format(product))
+    if os.path.isfile(os.path.join(working_directory, "{}.tfvars".format(component))):
+        additional_tf_args["var_file"].append("{}.tfvars".format(component))
+    return additional_tf_args
+
+
+def initialize_tf(portfolio, product, component, region):
+    backend_config = {"bucket": "{}-state-bucket".format(portfolio),
+                      "key": "{}/{}/terraform.tfstate".format(product, component),
+                      "region": region}
+
+    print("Terraform init started")
+    tf.init(backend_config=backend_config)
+    print("Terraform init finished")
+
+
+def run_tf_command(command, working_directory, portfolio, product, component, environment, region):
+
+    global tf
+
+    additional_tf_args = get_additional_tf_args(working_directory, portfolio, product, environment, component, region)
+
+    if command == "plan":
+        return_code, stdout, stderr = tf.plan(**additional_tf_args)
+        print("Terraform plan returned with code " + str(return_code))
+    elif command == "apply":
+        return_code, stdout, stderr = tf.apply(**additional_tf_args)
+        print("Terraform apply returned with code " + str(return_code))
+    elif command == "destroy":
+        return_code, stdout, stderr = tf.destroy(**additional_tf_args)
+        print("Terraform destroy returned with code " + str(return_code))
+    else:
+        print("Must pass command line argument of plan, apply, or destroy")
+
+
+def select_workspace(environment):
+    global tf
+    print("Selecting workspace")
+    if environment not in tf.list_workspaces(capture_output=True)[1]:
+        print("Creating workspace {}".format(environment))
+        tf.create_workspace(environment)
+    else:
+        print("Workspace already exists. Switching to it.")
+    if tf.show_workspace(capture_output=True)[1].strip() != environment:
+        print("Switching workspace to {}".format(environment))
+        tf.set_workspace(environment)
+    else:
+        print("Already on required workspace")
+
+
+@click.command()
+@click.argument('command')
+@click.argument('component')
+@click.option("--log-level", "-l", default=None, help="Increase terraform verbosity (log level)")
+@click.option("--portfolio", "-d", default=None, help="Top level Portfolio / Domain")
+@click.option("--product", "-p", default=None, help="Product under portfolio")
+@click.option("--environment", "-e", default="dev", help="environment")
+@click.option("--region", "-r", default="us-west-2", help="AWS Region to run terraform against")
+def main(command, component, log_level, portfolio, product, environment, region):
+    global tf
+    working_directory = os.path.join(os.path.dirname(os.path.realpath(__file__)), "infra", "components", component)
+
+    tf = Terraform(working_dir=working_directory)
+
+    validate_args(command, component, log_level, region)
+
+    initialize_tf(portfolio, product, component, region)
+
+    select_workspace(environment)
+
+    run_tf_command(command, working_directory, portfolio, product, component, environment, region)
+
+
+if __name__ == "__main__":
+    main()
+    sys.exit(0)
